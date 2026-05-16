@@ -1,0 +1,25 @@
+# Fly.io — free tier (shared-cpu-1x, 256 MB RAM) is plenty for scripty
+# Deploy: fly launch (first time) / fly deploy (updates)
+# Secrets: fly secrets set TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=xxx SEARCH_TERMS=xxx
+
+app = "scripty"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DB_PATH = "/data/seen.db"
+  PLATFORMS = "github,twitter,web"
+  CHECK_INTERVAL_MINUTES = "15"
+  LOOKBACK_HOURS = "24"
+
+# persistent volume for the SQLite dedup database
+[mounts]
+  source = "scripty_data"
+  destination = "/data"
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
