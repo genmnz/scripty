@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 scripty — fast, lightweight social media & web monitor
-Searches Twitter (Nitter), GitHub, and the web (DuckDuckGo) for configured terms.
-Sends new results to a Telegram group via bot.
+Searches Twitter (Nitter), GitHub (code + commits), Reddit, and DuckDuckGo
+for exact strings. Sends new hits to Telegram. Zero paid APIs.
 """
 import argparse
 import asyncio
@@ -13,7 +13,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Config (all via env vars) ─────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID: str = os.environ["TELEGRAM_CHAT_ID"]
@@ -35,13 +35,12 @@ CHECK_INTERVAL: int = int(os.environ.get("CHECK_INTERVAL_MINUTES", "15"))
 LOOKBACK_HOURS: int = int(os.environ.get("LOOKBACK_HOURS", "24"))
 PLATFORMS: set[str] = {
     p.strip().lower()
-    for p in os.environ.get("PLATFORMS", "github,twitter,web").split(",")
+    for p in os.environ.get("PLATFORMS", "github,twitter,reddit,web").split(",")
     if p.strip()
 }
 GITHUB_TOKEN: str = os.environ.get("GITHUB_TOKEN", "")
 DB_PATH: str = os.environ.get("DB_PATH", "seen.db")
 
-# Nitter public instances — tried in order, first healthy one is used
 NITTER_INSTANCES = [
     "https://nitter.privacydev.net",
     "https://nitter.poast.org",
@@ -100,18 +99,18 @@ class Store:
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
-PLATFORM_EMOJI = {"github": "🐙", "twitter": "🐦", "web": "🌐"}
+_EMOJI = {"github": "🐙", "twitter": "🐦", "reddit": "🟠", "web": "🌐"}
 
 
 def _fmt_hit(hit: Hit) -> str:
-    emoji = PLATFORM_EMOJI.get(hit.platform, "🔍")
+    emoji = _EMOJI.get(hit.platform, "🔍")
     age = ""
     if hit.published:
         delta = datetime.now(timezone.utc) - hit.published.astimezone(timezone.utc)
         h = int(delta.total_seconds() // 3600)
         age = f" · {h}h ago" if h < 48 else ""
-    snippet = hit.snippet[:280].replace("<", "&lt;").replace(">", "&gt;") if hit.snippet else ""
     title = hit.title.replace("<", "&lt;").replace(">", "&gt;")
+    snippet = hit.snippet[:300].replace("<", "&lt;").replace(">", "&gt;") if hit.snippet else ""
     return (
         f'{emoji} <b>{hit.platform.upper()}</b> — <code>{hit.term}</code>{age}\n'
         f'<b>{title}</b>\n'
@@ -142,64 +141,161 @@ async def send_telegram(client: httpx.AsyncClient, text: str) -> None:
 async def notify_batch(client: httpx.AsyncClient, hits: list[Hit]) -> None:
     for hit in hits:
         await send_telegram(client, _fmt_hit(hit))
-        await asyncio.sleep(0.3)  # avoid Telegram flood limits
+        await asyncio.sleep(0.4)  # stay under Telegram flood limits
 
 
-# ── GitHub search ─────────────────────────────────────────────────────────────
+# ── GitHub — full-text code + commit search ───────────────────────────────────
+#
+# Uses the same backend as github.com/search?type=code and type=commits.
+# Code search scans actual file contents. Commit search scans commit messages.
+# Rate limits: 10 req/min unauthenticated → 30 req/min with any personal token.
 
 
 async def search_github(client: httpx.AsyncClient, term: str, since: datetime) -> list[Hit]:
-    headers: dict[str, str] = {"Accept": "application/vnd.github.v3+json", "User-Agent": "scripty/1.0"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
-
     since_str = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     hits: list[Hit] = []
 
-    queries = [
-        # (endpoint, date_field, label)
-        ("repositories", f"{quote_plus(term)}+pushed:>{since_str}", "pushed_at"),
-        ("issues", f"{quote_plus(term)}+created:>{since_str}", "created_at"),
-    ]
+    base_headers: dict[str, str] = {"User-Agent": "scripty/1.0"}
+    if GITHUB_TOKEN:
+        base_headers["Authorization"] = f"token {GITHUB_TOKEN}"
 
-    for endpoint, q, date_field in queries:
-        url = f"https://api.github.com/search/{endpoint}?q={q}&sort=updated&order=desc&per_page=15"
-        try:
-            r = await client.get(url, headers=headers, timeout=15)
-            if r.status_code == 403:
-                log.warning("GitHub rate-limited — add GITHUB_TOKEN to get 3× more quota")
-                break
-            if r.status_code != 200:
-                log.warning("GitHub %s %s: %s", endpoint, r.status_code, r.text[:100])
-                continue
-            data = r.json()
-        except Exception as exc:
-            log.warning("GitHub error: %s", exc)
+    # ── Code search (file contents) ──────────────────────────────────────────
+    # pushed:>DATE narrows to repos that received commits recently
+    code_headers = {**base_headers, "Accept": "application/vnd.github.v3+json"}
+    code_url = (
+        f"https://api.github.com/search/code"
+        f"?q={quote_plus(term)}+pushed:>{since_str}"
+        f"&sort=indexed&order=desc&per_page=20"
+    )
+    try:
+        r = await client.get(code_url, headers=code_headers, timeout=15)
+        if r.status_code == 403:
+            log.warning("GitHub rate-limited (code) — set GITHUB_TOKEN for 3× quota")
+        elif r.status_code == 200:
+            for item in r.json().get("items", []):
+                repo = item.get("repository", {})
+                path = item.get("path", "")
+                link = item.get("html_url", "")
+                title = f"{repo.get('full_name', '')} — {path}"
+                # text_matches gives highlighted snippets when using the text-match media type;
+                # fall back to the repo description
+                snippet = repo.get("description") or ""
+                if link:
+                    hits.append(Hit(
+                        platform="github", term=term,
+                        title=title, url=link, snippet=snippet, published=None,
+                    ))
+        else:
+            log.warning("GitHub code search %s: %s", r.status_code, r.text[:120])
+    except Exception as exc:
+        log.warning("GitHub code search error: %s", exc)
+
+    await asyncio.sleep(1.2)  # stay inside rate limit window
+
+    # ── Commit search (commit messages) ──────────────────────────────────────
+    # author-date:>DATE is a valid qualifier for /search/commits
+    commit_headers = {
+        **base_headers,
+        # cloak-preview unlocks the commits search endpoint
+        "Accept": "application/vnd.github.cloak-preview+json",
+    }
+    commit_url = (
+        f"https://api.github.com/search/commits"
+        f"?q={quote_plus(term)}+author-date:>{since_str}"
+        f"&sort=author-date&order=desc&per_page=15"
+    )
+    try:
+        r = await client.get(commit_url, headers=commit_headers, timeout=15)
+        if r.status_code == 403:
+            log.warning("GitHub rate-limited (commits)")
+        elif r.status_code == 200:
+            for item in r.json().get("items", []):
+                commit = item.get("commit", {})
+                repo = item.get("repository", {})
+                msg = commit.get("message", "").split("\n")[0]  # first line only
+                link = item.get("html_url", "")
+                raw_date = commit.get("author", {}).get("date") or commit.get("committer", {}).get("date")
+                dt = None
+                if raw_date:
+                    try:
+                        dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+                title = f"{repo.get('full_name', 'unknown')} — {msg[:80]}"
+                if link:
+                    hits.append(Hit(
+                        platform="github", term=term,
+                        title=title, url=link, snippet=msg, published=dt,
+                    ))
+        else:
+            log.warning("GitHub commit search %s: %s", r.status_code, r.text[:120])
+    except Exception as exc:
+        log.warning("GitHub commit search error: %s", exc)
+
+    return hits
+
+
+# ── Reddit ────────────────────────────────────────────────────────────────────
+#
+# Reddit's public JSON API, no key required. Searches posts across all
+# subreddits. time filter maps to the nearest bucket that covers LOOKBACK_HOURS.
+
+
+def _reddit_time_filter() -> str:
+    if LOOKBACK_HOURS <= 1:
+        return "hour"
+    if LOOKBACK_HOURS <= 24:
+        return "day"
+    if LOOKBACK_HOURS <= 168:
+        return "week"
+    return "month"
+
+
+async def search_reddit(client: httpx.AsyncClient, term: str, since: datetime) -> list[Hit]:
+    tf = _reddit_time_filter()
+    url = (
+        f"https://www.reddit.com/search.json"
+        f"?q={quote_plus(term)}&sort=new&t={tf}&limit=25&include_over_18=on"
+    )
+    headers = {
+        "User-Agent": "scripty:1.0 (monitoring bot)",
+        "Accept": "application/json",
+    }
+    try:
+        r = await client.get(url, headers=headers, timeout=15)
+        if r.status_code == 429:
+            log.warning("Reddit rate-limited, will retry next cycle")
+            return []
+        if r.status_code != 200:
+            log.warning("Reddit %s: %s", r.status_code, r.text[:120])
+            return []
+        data = r.json()
+    except Exception as exc:
+        log.warning("Reddit error: %s", exc)
+        return []
+
+    hits: list[Hit] = []
+    for child in data.get("data", {}).get("children", []):
+        post = child.get("data", {})
+        created = post.get("created_utc")
+        dt = datetime.fromtimestamp(created, tz=timezone.utc) if created else None
+
+        # skip posts outside our lookback window
+        if dt and dt < since:
             continue
 
-        for item in data.get("items", []):
-            dt = None
-            raw = item.get(date_field) or item.get("updated_at")
-            if raw:
-                try:
-                    dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                except ValueError:
-                    pass
+        title = post.get("title", "")
+        sub = post.get("subreddit_name_prefixed", "")
+        selftext = (post.get("selftext") or "")[:300]
+        permalink = post.get("permalink", "")
+        link = f"https://www.reddit.com{permalink}" if permalink.startswith("/") else permalink
 
-            if endpoint == "repositories":
-                title = item.get("full_name", "")
-                snippet = item.get("description") or ""
-                link = item.get("html_url", "")
-            else:
-                title = item.get("title", "")
-                snippet = (item.get("body") or "")[:300]
-                link = item.get("html_url", "")
-
-            if link:
-                hits.append(Hit(platform="github", term=term, title=title, url=link, snippet=snippet, published=dt))
-
-        # respect rate limit window
-        await asyncio.sleep(1)
+        snippet = f"r/{sub} — {selftext}" if selftext else sub
+        if link:
+            hits.append(Hit(
+                platform="reddit", term=term,
+                title=title, url=link, snippet=snippet.strip(" —"), published=dt,
+            ))
 
     return hits
 
@@ -233,7 +329,7 @@ async def search_twitter(client: httpx.AsyncClient, term: str, since: datetime) 
     try:
         r = await client.get(url, timeout=15)
         if r.status_code != 200:
-            _nitter_base = None  # retry probe next cycle
+            _nitter_base = None
             return []
     except Exception as exc:
         log.warning("Nitter error: %s", exc)
@@ -244,15 +340,12 @@ async def search_twitter(client: httpx.AsyncClient, term: str, since: datetime) 
     hits: list[Hit] = []
 
     for item in soup.select(".timeline-item"):
-        # timestamp
         dt = None
         date_tag = item.select_one(".tweet-date a")
         if date_tag:
-            title_attr = date_tag.get("title", "")
-            # Nitter format: "Jan 1, 2024 · 12:00 PM UTC"
+            # Nitter title attr: "Jan 1, 2024 · 12:00 PM UTC"
             try:
-                # strip the middot part
-                clean = re.sub(r"\s*·.*", "", title_attr).strip()
+                clean = re.sub(r"\s*·.*", "", date_tag.get("title", "")).strip()
                 dt = datetime.strptime(clean, "%b %d, %Y %I:%M %p UTC").replace(tzinfo=timezone.utc)
             except ValueError:
                 pass
@@ -265,22 +358,17 @@ async def search_twitter(client: httpx.AsyncClient, term: str, since: datetime) 
         if not text:
             continue
 
-        username_tag = item.select_one(".username")
+        username = (item.select_one(".username") or item).get_text(strip=True)
         fullname_tag = item.select_one(".fullname")
-        username = username_tag.get_text(strip=True) if username_tag else "unknown"
         fullname = fullname_tag.get_text(strip=True) if fullname_tag else username
 
-        tweet_link_tag = item.select_one(".tweet-date a")
-        href = tweet_link_tag["href"] if tweet_link_tag else ""
+        href = date_tag["href"] if date_tag else ""
         tweet_url = f"https://x.com{href}" if href.startswith("/") else href
 
         hits.append(Hit(
-            platform="twitter",
-            term=term,
+            platform="twitter", term=term,
             title=f"{fullname} ({username})",
-            url=tweet_url,
-            snippet=text[:300],
-            published=dt,
+            url=tweet_url, snippet=text[:300], published=dt,
         ))
 
     return hits
@@ -290,18 +378,16 @@ async def search_twitter(client: httpx.AsyncClient, term: str, since: datetime) 
 
 
 async def search_web(client: httpx.AsyncClient, term: str, since: datetime) -> list[Hit]:
-    # df=d = past day, df=w = past week
-    hours = max(1, LOOKBACK_HOURS)
-    df = "d" if hours <= 24 else "w"
+    df = "d" if LOOKBACK_HOURS <= 24 else "w"
     url = f"https://html.duckduckgo.com/html/?q={quote_plus(term)}&df={df}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; scripty/1.0)",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
         "Accept-Language": "en-US,en;q=0.9",
     }
     try:
         r = await client.get(url, headers=headers, timeout=15, follow_redirects=True)
         if r.status_code != 200:
-            log.warning("DDG %s: %s", r.status_code, r.text[:100])
+            log.warning("DDG %s", r.status_code)
             return []
     except Exception as exc:
         log.warning("DDG error: %s", exc)
@@ -317,27 +403,19 @@ async def search_web(client: httpx.AsyncClient, term: str, since: datetime) -> l
             continue
 
         href = title_tag.get("href", "")
-        # DDG wraps URLs — extract real URL from uddg param or use as-is
         real_url = href
-        if "duckduckgo.com/l/" in href or href.startswith("//duckduckgo.com"):
+        if "duckduckgo.com" in href:
             m = re.search(r"[?&]uddg=([^&]+)", href)
-            if m:
-                from urllib.parse import unquote
-                real_url = unquote(m.group(1))
+            real_url = unquote(m.group(1)) if m else href
 
         if not real_url or real_url.startswith("//"):
             continue
 
         title = title_tag.get_text(strip=True)
         snippet = snippet_tag.get_text(" ", strip=True) if snippet_tag else ""
-
         hits.append(Hit(
-            platform="web",
-            term=term,
-            title=title,
-            url=real_url,
-            snippet=snippet[:300],
-            published=None,
+            platform="web", term=term,
+            title=title, url=real_url, snippet=snippet[:300], published=None,
         ))
 
     return hits
@@ -351,12 +429,14 @@ async def run_cycle(client: httpx.AsyncClient, store: Store) -> int:
     all_new: list[Hit] = []
 
     for term in SEARCH_TERMS:
-        log.info("Searching for: %s", term)
+        log.info("Searching: %r", term)
         tasks = []
         if "github" in PLATFORMS:
             tasks.append(search_github(client, term, since))
         if "twitter" in PLATFORMS:
             tasks.append(search_twitter(client, term, since))
+        if "reddit" in PLATFORMS:
+            tasks.append(search_reddit(client, term, since))
         if "web" in PLATFORMS:
             tasks.append(search_web(client, term, since))
 
@@ -379,14 +459,17 @@ async def run_cycle(client: httpx.AsyncClient, store: Store) -> int:
 
 async def main(run_once: bool = False) -> None:
     if not SEARCH_TERMS:
-        raise SystemExit("Set SEARCH_TERMS env var (comma-separated keywords)")
+        raise SystemExit("Set SEARCH_TERMS env var (comma-separated strings to search)")
 
-    log.info("scripty starting — terms: %s | platforms: %s | interval: %dm | lookback: %dh",
-             ", ".join(SEARCH_TERMS), ", ".join(sorted(PLATFORMS)), CHECK_INTERVAL, LOOKBACK_HOURS)
+    log.info(
+        "scripty — terms: %s | platforms: %s | every %dm | lookback %dh",
+        ", ".join(SEARCH_TERMS), ", ".join(sorted(PLATFORMS)),
+        CHECK_INTERVAL, LOOKBACK_HOURS,
+    )
 
     store = Store(DB_PATH)
-
     limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+
     async with httpx.AsyncClient(limits=limits, follow_redirects=True) as client:
         while True:
             try:
